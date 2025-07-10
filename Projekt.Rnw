@@ -1,0 +1,299 @@
+\documentclass[12pt, a4paper]{article}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+  % dodatkowe pakiety LaTeX'a
+\usepackage[OT4]{polski}
+\usepackage[utf8]{inputenc}
+\usepackage[top=2.5cm, bottom=2.5cm, left=2cm, right=2cm]{geometry}
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage[colorlinks=true, linkcolor=blue]{hyperref}
+\usepackage{amsfonts}
+\usepackage{amsmath}
+\usepackage{grfext}
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% ustawienia globalne
+<<ustawienia_globalne, echo=FALSE, warning=FALSE>>=
+library(knitr)
+library(xtable) #pakiet do tworzenia tabel w formacie LaTeX'a
+opts_chunk$set(fig.path='figure/', fig.align='center', fig.pos='H',fig.width=5, fig.height=4)
+# UWAGA: w razie potrzeby można zmieniać te ustawienia w danym chunk'u!
+@
+  
+  
+\begin{document}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+  % strona tytulowa
+\title{Projekt Big Data, Money}
+\author{Maciej Łosiewicz}
+\maketitle
+\tableofcontents
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+  
+<<wstep, echo=FALSE, eval=TRUE, error=FALSE, warning=FALSE, results='hide', message=FALSE>>=
+spath <- file.path(Sys.getenv("SPARK_HOME"),"R","lib")
+library(SparkR, lib.loc=spath)
+@
+\newpage
+W tym sprawozdaniu zajmiemy się analizą danych ze zrzutu z sieci Stack Exchange, a dokładniej z "money.stackexchange.com". Zbudujemy model predykcyjny, sprawdzający czy na dane pytanie została udzielona zaakceptowana odpowiedź, korzystając z danych ze zrzutu. Stworzymy także nowe cechy, a następnie na podstawie analizy spróbujemy wyciągnąć wnioski na temat tego, jaki model się najlepiej dopasował oraz sprawdzimy, czy na podstawie wniosków możemy coś powiedzieć o zachowaniu użytkowników tego portalu.
+
+\section{Wprowadzenie danych}
+
+W tej krótkiej sekcji dokonamy wprowadzenia danych.
+
+<<W_1, echo=TRUE, eval=TRUE, error=FALSE, warning=FALSE, message=FALSE, results='hide'>>=
+
+sparkR.session(master = "local[*]", 
+               sparkConfig = list(spark.driver.memory="2g"), 
+               sparkPackages = "com.databricks:spark-xml_2.12:0.17.0")
+
+## W poniższych funkcjach należy wpisać ścieżkę ze swojego urządzenia
+
+posts <- read.df("E:/1RStudio/Big Data/Projekt/Posts.xml",
+                 source = "com.databricks.spark.xml",
+                 rootTag = "posts", rowTag = "row")
+users <- read.df("E:/1RStudio/Big Data/Projekt/Users.xml",
+                 source = "com.databricks.spark.xml",
+                 rootTag = "users", rowTag = "row")
+@
+
+Zmienimy też nazw kolumny, by były one prostsze do odczytania i użytku.
+
+<<W_2, echo=TRUE, eval=TRUE, error=FALSE, warning=FALSE>>=
+stare_nazwy_posts <- colnames(posts)
+nowe_nazwy_posts <- c("AcceptedAnswerId", "AnswerCount", "Body", 
+                      "ClosedDate", "CommentCount", "CommunityOwnedDate", 
+                      "ContentLicense", "CreationDate", "FavoriteCount", 
+                      "PostId", "LastActivityDate", "LastEditDate", 
+                      "LastEditorDisplayName", "LastEditorUserId", 
+                      "OwnerDisplayName", "OwnerUserId", "ParentId", 
+                      "PostTypeId", "Score", "Tags", "Title", "ViewCount")
+
+stare_nazwy_users <-colnames(users)
+nowe_nazwy_users <-c("AboutMe", "AccountId", "CreationDate", "DisplayName",
+                     "DownVotes", "Id", "LastAccessDate", "Location", 
+                     "Reputation", "UpVotes", "Views", "WebsiteUrl")
+
+for (i in 1:length(stare_nazwy_posts)) {
+  posts <- withColumnRenamed(posts, stare_nazwy_posts[i], nowe_nazwy_posts[i])
+}
+
+for (i in 1:length(stare_nazwy_users)) {
+  users <- withColumnRenamed(users, stare_nazwy_users[i], nowe_nazwy_users[i])
+}
+@
+
+\section{Przygotowanie danych}
+
+Teraz przygotujemy dane do użytku. Zacznijmy od pozbycia się zbędnych nam kolumn.
+
+<<P_1, echo=TRUE, eval=TRUE, error=FALSE, warning=FALSE>>=
+
+users <- users |> drop(c("AboutMe", "AccountId", "CreationDate", "Location",
+                         "WebsiteUrl", "LastAccessDate"))
+
+posts <- withColumn(posts, "BodyLength", NA)
+posts$BodyLength <- length(posts$Body)
+
+@
+
+Teraz stworzymy zbiór pytań, a także nowy binarny atrybut mówiący nam, czy jakakolwiek odpowiedź została zatwiedzona.
+
+<<P_2, echo=TRUE, eval=TRUE, error=FALSE, warning=FALSE>>=
+
+questions <- posts[posts$PostTypeId==1, 
+                   c("PostId", "BodyLength", "AcceptedAnswerId", "Tags",
+                     "AnswerCount", "OwnerUserId")]
+
+questions <- questions |> 
+  withColumn("AcceptedAnswerId2", questions$AcceptedAnswerId)
+
+# Pozbywamy się wartości NA i podstawiamy 0.
+
+questions <- questions |> fillna(0, cols = "AcceptedAnswerId2")
+
+@
+
+Następnie, dla wartości "$0$" zapisujemy, że nie było zatwierdzonej odpowiedzi, i analogicznie dla "$1$" zapisujemy, że została zatwiedzona odpowiedź.
+
+<<P_3, echo=TRUE, eval=TRUE, error=FALSE, warning=FALSE>>=
+
+questionsWithNA <- 
+  questions[questions$AcceptedAnswerId2==0] |> withColumn("AnyAccepted", 0)
+
+questionsWithoutNA <- 
+  questions[questions$AcceptedAnswerId2!=0] |> withColumn("AnyAccepted", 1)
+@
+
+Teraz możemy połączyć kolumny po "Id" oraz usunąć poprzednią, pomocniczą kolumnę. Przygotujemy także tagi, by były bez znaków "$<$", "$>$", oraz by były oddzielane przecinkiem.
+
+<<P_4, echo=TRUE, eval=TRUE, error=FALSE, warning=FALSE>>=
+
+questions <- orderBy(union(questionsWithNA, questionsWithoutNA),
+                     "PostId") |> drop("AcceptedAnswerId2")
+
+tags_in_array <- questions[,c("PostId", "Tags")] |> 
+  withColumn("TagsSplit",
+             split_string(rtrim(ltrim(questions$Tags, '<'), '>'), '><'))
+
+
+#head(collect(tags_in_array))
+#Możemy sprawdzić, że tagi w rzeczy samej są rozdzielone przecinkiem.
+
+@
+
+Podsumowujemy przygotowanie danych poprzez rozbicie listy na wiele wierszy i poprawienie nazw kolumn.
+
+<<P_5, echo=TRUE, eval=TRUE, error=FALSE, warning=FALSE>>=
+
+question_tags <- tags_in_array |> 
+  withColumn('tag', explode(tags_in_array$TagsSplit))
+group_of_tags <- question_tags[,c("PostId", "tag")] |> 
+  groupBy("PostId") |> count()
+group_of_tags <- withColumnRenamed(group_of_tags, "count", "TagsCount")
+group_of_tags <- withColumnRenamed(group_of_tags, "PostId", "__Id")
+
+questions <- join(questions, group_of_tags, 
+                  questions$PostId==group_of_tags$`__Id`)
+questions <- questions |> drop(col = c("__Id"))
+@
+
+\section{Analiza danych}
+
+W tej części podsumujemy przygotowanie danych i stworzymy modele. Zaczniemy od zliczania ilości pytań względem użytkownika, a także połączenia table "questions" i "users"
+
+
+<<A_1, echo=TRUE, eval=TRUE, error=FALSE, warning=FALSE>>=
+
+group_by_user <- questions |> groupBy("OwnerUserId") |> 
+  count() |> orderBy("count", decreasing = T)
+ques_with_users <- 
+  join(questions, users, questions$OwnerUserId==users$Id) |> 
+  drop(c("Id", "OwnerUserId"))
+@
+
+Rozdzielmy także dane na dane treningowe treningowe i testowe.
+
+<<A_2, echo=TRUE, eval=TRUE, error=FALSE, warning=FALSE>>=
+
+df_list <- randomSplit(ques_with_users, c(8,2), 100)
+train <- df_list[[1]]
+test <- df_list[[2]]
+
+@
+
+Zaczniemy od modelu logistycznego.
+
+<<A_3, echo=TRUE, eval=TRUE, error=FALSE, warning=FALSE>>=
+
+M1 <- spark.logit(train, AnyAccepted ~ BodyLength + AnswerCount + TagsCount + 
+                    Reputation + Views + UpVotes + DownVotes)
+predictions_M1 <- predict(M1, test)[,c("AnyAccepted", "prediction")]
+summary(M1)
+
+@
+
+Jak można zauważyć, "Views", "Reputation" oraz "BodyLength" mają wpływ rzędu $10^{-5}$, więc stworzymy model który nie bierze ich pod uwagę.
+
+<<A_3b, echo=TRUE, eval=TRUE, error=FALSE, warning=FALSE>>=
+
+M1 <- spark.logit(train, AnyAccepted ~ AnswerCount + TagsCount + 
+                     UpVotes + DownVotes)
+predictions_M1 <- predict(M1, test)[,c("AnyAccepted", "prediction")]
+summary(M1)
+
+@
+
+Jak widzimy, zmienne nie podległy drastycznym zmianom, więc możemy założyć że zmienne których się pozbyliśmy miały w rzeczy samej marginalny wpływ na akceptacje odpowiedzi.
+
+
+Teraz stwórzmy funkcję która wyliczy nam odpowiednie miary.  
+
+<<A_4, echo=TRUE, eval=TRUE, error=FALSE, warning=FALSE>>=
+
+measures <- function(predictions, p=0.5){
+  d1 <- predictions[predictions$AnyAccepted==1]
+  FN <- count(d1[d1$prediction<p])  # False Negative
+  TP <- count(d1[d1$prediction>=p]) # True Positive
+  
+  d2 <- predictions[predictions$AnyAccepted==0]
+  TN <- count(d2[d2$prediction<p])  # True Negative
+  FP <- count(d2[d2$prediction>=p]) # False Positive
+  
+  ACC <- (TP+TN)/(TP+FN+TN+FP)      # Dokładność
+  FDR <- FP/(TP+FP)                 # False discovery rate (1-precyzja)
+  TPR <- TP/(TP+FN)                 # Czułość
+  TNR <- TN/(FP+TN)                 # Swoistość
+  result <- matrix(c(TP,FN,TN,FP,ACC,FDR,TPR,TNR), nrow = 1)
+  colnames(result) <- c("TP", "FN", "TN", "FP", "ACC", "FDR", "TPR", "TNR")
+  return(result)
+}
+
+measures(predictions_M1)
+
+@
+
+
+Następnie stworzymy modele dla regresji liniowej, lasu losowego i drzewa decyzyjnego.
+
+<<A_5, echo=TRUE, eval=TRUE, error=FALSE, warning=FALSE>>=
+
+M2 <- spark.lm(train, AnyAccepted ~ AnswerCount + TagsCount + 
+                     UpVotes + DownVotes)
+predictions_M2 <- predict(M2, test)[,c("AnyAccepted", "prediction")]
+measures(predictions_M2)
+
+@
+
+Jak widzimy, model regresji liniowej jest trochę gorszy od modelu logistycznego jeżeli patrzymy na czułość, dokładność i kontrolę fałszywych wyników, ale jest też trochę lepszy jeżeli chodzi o swoistość.
+
+Następnie sprawdźmy model "Random Forest". Algorytm lasu losowego wykorzystuje wiele drzew decyzyjnych, które są budowane na losowych podzbiorach danych treningowych i cech, a następnie kombinuje wyniki tych drzew poprzez głosowanie większościowe, aby uzyskać ostateczną klasyfikację lub prognozę. Dzięki temu zapewnia on wysoką wydajność i odporność na przeuczenie.
+
+<<A_6, echo=TRUE, eval=TRUE, error=FALSE, warning=FALSE>>=
+
+M3 <- spark.randomForest(train, type = "classification", numTrees = 10,
+                  AnyAccepted ~ AnswerCount + TagsCount + UpVotes + DownVotes)
+predictions_M3 <- predict(M3, test)[,c("AnyAccepted", "prediction")]
+measures(predictions_M3)
+
+@
+
+Następnie wykorzystamy model drzewa decyzyjnego. Drzewa decyzyjne są strukturami modelowania danych, które operują na zasadzie hierarchicznych drzew. Rozpoczynając od korzenia, reprezentującego pełen zbiór danych, drzewa decyzyjne dokonują serii podziałów, wybierając kolejne cechy, które najlepiej segregują dane na bardziej jednorodne grupy. Każdy węzeł w drzewie reprezentuje decyzję na podstawie konkretnych cech, prowadząc do kolejnych gałęzi lub liści, które reprezentują ostateczne klasyfikacje lub prognozy. Proces ten jest realizowany poprzez iteracyjne wybieranie najlepszych podziałów na podstawie kryteriów czystości zbioru danych, takich jak entropia czy impurity. Dzięki swojej intuicyjnej strukturze, drzewa decyzyjne są często stosowane do analizy i klasyfikacji danych, jednak wymagają odpowiedniej optymalizacji i przycinania, aby uniknąć zjawiska nadmiernego dopasowania do danych treningowych.
+
+<<A_7, echo=TRUE, eval=TRUE, error=FALSE, warning=FALSE>>=
+
+M4 <- spark.decisionTree(train, AnyAccepted ~ AnswerCount + TagsCount + 
+                     UpVotes + DownVotes)
+predictions_M4 <- predict(M4, test)[,c("AnyAccepted", "prediction")]
+measures(predictions_M4)
+
+@
+
+Jak widzimy, wyniki obydwu tych modeli są do siebie zbliżone, co pokazuje nam, że wariancja danych jest mała.
+
+<<A_8, echo=FALSE, eval=TRUE, error=FALSE, warning=FALSE, fig.width=10, results="asis">>=
+
+M <- list(0.5820572, 0.3976471, 0.2295964,  0.8743183,
+          0.5812441, 0.3844062, 0.2029895,  0.8948934,
+          0.7049736, 0.3669098, 0.8304933,  0.6008924,
+          0.7051091, 0.364605,  0.8200299,  0.6098166)
+wyniki <- matrix(M, nrow = 4, byrow = TRUE)
+rownames(wyniki) <- c("Model logistyczny", "Model regresji liniowej", "Model lasu losowego", "Model drzewa decyzyjnego")
+colnames(wyniki) <- c("ACC", "FDR", "TPR", "TNR")
+tab_1 <- xtable(wyniki, digits = 4, row.names = TRUE,
+                caption = "Wartości miar dla różnych modeli predykcyjnych")
+print(tab_1, type = "latex", table.placement = "H", sanitize.text.function = function(x){x})
+
+@
+
+Podsumowując, wszystkie cztery modele wykorzystane do predykcji danych mają swoje zalety i wady. Jeżeli chcemy model z bardzo wysoką swoistością, powinniśmy użyć modelu logistycznego bądź regresji liniowej, natomiast jeżeli chcemy model z lepszą dokładnością i kontrolą fałszywych wyników, możemy skorzystać z drzewa decyzyjnego dla mniejszych rozmiarów danych, bądź lasu losowego dla większego rozmiaru danych.
+
+Jak możemy też zobaczyć z wcześniejszej analizy zmiennych, największy wpływ na zatwierdzenie odpowiedzi ma ilość tychże odpowiedzi, co jest spodziewanym wynikiem. Jak możemy też zauważyć, wpływ mają "UpVote'y" oraz "DownVote'y", przy czym oczywiście "DownVote'y" mają negatywny wpływ.
+
+
+\end{document}
